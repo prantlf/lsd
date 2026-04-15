@@ -1,0 +1,10 @@
+{
+  "files.exclude": {
+    "**/.git": true,
+    "**/.zig-cache": true,
+    "**/.DS_Store": true
+  },
+  "search.exclude": {
+    "**/zig-out": true
+  }
+}
