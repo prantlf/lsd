@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // Allows formatted output to stdout.
-const out = std.fs.File.stdout().deprecatedWriter();
+var out: *std.Io.Writer = undefined;
 
 // Provides logging configurable during the runtime (hence the default log level
 // "debug") and also the scoped logging (lsd) in this file.
@@ -21,27 +21,28 @@ var log_level: std.log.Level = .warn;
 const log = std.log.scoped(.lsd);
 
 // Initializes the log level.
-fn initLog(allocator: std.mem.Allocator) !void {
+fn configureLog(allocator: std.mem.Allocator, environ: std.process.Environ) !void {
     // Set the log level from the environment variable LOG_LEVEL.
-    var env = try std.process.getEnvMap(allocator);
-    defer env.deinit();
-
-    const log_level_name = env.get("LOG_LEVEL") orelse "";
-    if (log_level_name.len > 0) {
-        log_level = std.meta.stringToEnum(std.log.Level, log_level_name) orelse {
-            std.log.err("Invalid value of LOG_LEVEL: \"{s}\"", .{log_level_name});
-            std.process.exit(1);
-        };
+    if (try environ.containsUnempty(allocator, "LOG_LEVEL")) {
+        const log_level_name = try environ.getAlloc(allocator, "LOG_LEVEL");
+        defer allocator.free(log_level_name);
+        if (log_level_name.len > 0) {
+            log_level = std.meta.stringToEnum(std.log.Level, log_level_name) orelse {
+                std.log.err("Invalid value of LOG_LEVEL: \"{s}\"", .{log_level_name});
+                std.process.exit(1);
+            };
+        }
     }
 }
 
 // Parses the command line arguments and returns program configuration.
-fn parseArgs() struct { path: []const u8 } {
+fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !struct { path: []const u8 } {
+    var iterator = try args.iterateAllocator(allocator);
+    defer iterator.deinit();
     // Skip the first argument, which is the executable and read a path
     // from the second argument, defaulting to the current directory.
-    var args = std.process.args();
-    _ = args.next();
-    const path = args.next() orelse ".";
+    _ = iterator.next();
+    const path = iterator.next() orelse ".";
 
     // Print usage instructions if -h or --help is provided instead of a path.
     if (std.mem.eql(u8, path, "-h") or std.mem.eql(u8, path, "--help")) {
@@ -85,21 +86,22 @@ fn lessFileBySizeAndName(_: void, left: File, right: File) bool {
     if (left.size != right.size) {
         return left.size < right.size;
     }
-    return std.mem.order(u8, left.name[0..], right.name[0..]) == .lt;
+    return std.mem.order(u8, left.name, right.name) == .lt;
 }
 
 // Prints a file name and size on the same line.
 fn printFile(file: File) !void {
     try out.print("{s: <64}\t{d}\n", .{ file.name, file.size });
+    try out.flush();
 }
 
 // Lists all files in the specified directory.
-fn listFiles(allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(File) {
+fn listFiles(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(File) {
     // Open the specified directory to iterate over its contents.
     log.info("Listing directory: \"{s}\".", .{path});
-    const cwd = std.fs.cwd();
-    var dir = try cwd.openDir(path, .{ .iterate = true });
-    defer dir.close();
+    const cwd = std.Io.Dir.cwd();
+    var dir = try cwd.openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
 
     // Initialize an array list to hold the files we find in the directory.
     var files = try std.ArrayList(File).initCapacity(allocator, 1024);
@@ -107,10 +109,10 @@ fn listFiles(allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(File
 
     // Collect names and sizes of all files from the directory.
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        if (entry.kind == std.fs.File.Kind.file) {
+    while (try iter.next(io)) |entry| {
+        if (entry.kind == std.Io.File.Kind.file) {
             log.debug("Found file: \"{s}\"", .{entry.name});
-            const stat = try dir.statFile(entry.name);
+            const stat = try dir.statFile(io, entry.name, .{});
             log.debug(" with size: {d}", .{stat.size});
             const file = try File.init(allocator, entry.name, stat.size);
             try files.append(allocator, file);
@@ -150,21 +152,30 @@ fn printDuplicates(files: []File) !void {
     log.info("Found {d} duplicate files.\n", .{dupes});
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Use just one general allocator for simplicity.
-    const log_alloc = builtin.mode == .Debug;
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .verbose_log = log_alloc }){};
-    defer std.debug.assert(gpa.deinit() == .ok);
-    const allocator = gpa.allocator();
+    var debug_allocator = std.heap.DebugAllocator(.{ .verbose_log = true }){};
+    const allocator, const is_debug = switch (builtin.mode) {
+        .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
+        .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
+    };
+    defer if (is_debug) {
+        std.debug.assert(debug_allocator.deinit() == .ok);
+    };
 
-    // Initialize the log level.
-    try initLog(allocator);
+    // Configure the log level.
+    try configureLog(allocator, init.minimal.environ);
+
+    // Create a writer to the standard output.
+    var out_buf: [1024]u8 = undefined;
+    var out_writer = std.Io.File.stdout().writer(init.io, &out_buf);
+    out = &out_writer.interface;
 
     // Parse the command line arguments and read program configuration.
-    const args = parseArgs();
+    const args = try parseArgs(allocator, init.minimal.args);
 
     // List all files in the specified directory.
-    var files = try listFiles(allocator, args.path);
+    var files = try listFiles(init.io, allocator, args.path);
     defer freeFiles(allocator, &files);
 
     // Sort the files by size and name.
